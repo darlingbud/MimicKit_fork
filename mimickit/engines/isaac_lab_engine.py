@@ -938,8 +938,34 @@ class IsaacLabEngine(engine.Engine):
         actuator_cfg = self._build_actuator_cfg(control_mode)
 
         prim_path = OBJ_PATH_TEMPLATE.format(env_id, obj_id)
-        init_state = ArticulationCfg.InitialStateCfg(pos=obj_cfg.start_pos, rot=obj_cfg.start_rot)
-        
+
+        # Isaac Lab's Articulation._validate_cfg raises a ValueError if the USD
+        # default joint positions fall outside the configured joint limits
+        # (e.g. GO2 *_calf_joint default is 0, limits are [-2.723, -0.838]).
+        # Provide safe defaults via init_state.joint_pos. MimicKit's per-env
+        # init_pose / motion reset still override these at run time, so this
+        # only affects the USD default initialization.
+        # Isaac Lab's joint_pos is keyed by joint name (no regex), so list every joint.
+        default_joint_pos = {
+            "FR_hip_joint": 0.0,    "FR_thigh_joint": 0.9,    "FR_calf_joint": -1.5,
+            "FL_hip_joint": 0.0,    "FL_thigh_joint": 0.9,    "FL_calf_joint": -1.5,
+            "RR_hip_joint": 0.0,    "RR_thigh_joint": 0.9,    "RR_calf_joint": -1.5,
+            "RL_hip_joint": 0.0,    "RL_thigh_joint": 0.9,    "RL_calf_joint": -1.5,
+            # humanoid (37-DoF body parts, 1-DoF = revolute, 3-DoF = ball joint)
+            "abdomen_x": 0.0,  "abdomen_y": 0.0,  "abdomen_z": 0.0,
+            "neck_x": 0.0,     "neck_y": 0.0,     "neck_z": 0.0,
+            "right_shoulder_x": 0.0, "right_shoulder_y": 0.0, "right_shoulder_z": 0.0,
+            "right_elbow": 0.0,
+            "left_shoulder_x": 0.0,  "left_shoulder_y": 0.0,  "left_shoulder_z": 0.0,
+            "left_elbow": 0.0,
+            "right_hip_x": 0.0,  "right_hip_y": 0.0,  "right_hip_z": 0.0,
+            "right_knee": 0.0,   "right_ankle_x": 0.0, "right_ankle_y": 0.0, "right_ankle_z": 0.0,
+            "left_hip_x": 0.0,   "left_hip_y": 0.0,   "left_hip_z": 0.0,
+            "left_knee": 0.0,    "left_ankle_x": 0.0,  "left_ankle_y": 0.0,  "left_ankle_z": 0.0,
+        }
+        init_state = ArticulationCfg.InitialStateCfg(pos=obj_cfg.start_pos, rot=obj_cfg.start_rot,
+                                                     joint_pos=default_joint_pos)
+
         art_cfg = ArticulationCfg(prim_path=prim_path, spawn=usd_cfg, collision_group=0,
                                   init_state=init_state,
                                   actuator_value_resolution_debug_print=False,
@@ -1015,7 +1041,7 @@ class IsaacLabEngine(engine.Engine):
     def _disable_prim_collisions(self, prim_path):
         import isaaclab.sim as sim_utils
 
-        child_prims = sim_utils.get_all_matching_child_prims(prim_path, traverse_instance_prims=True)
+        child_prims = sim_utils.get_all_matching_child_prims(prim_path)
         for col_prim in child_prims:
             if (col_prim.IsInstanceable()):
                 col_prim.SetInstanceable(False)
