@@ -35,6 +35,51 @@ def str_to_key_code(key_str):
     key_code = getattr(carb.input.KeyboardInput, key_name)
     return key_code
 
+def calc_safe_joint_pos(asset_file):
+    """Build ArticulationCfg.InitialStateCfg.joint_pos defaults that satisfy Isaac Lab.
+
+    Isaac Lab's Articulation._validate_cfg() compares an articulation's default joint
+    positions against the joint limits read from PhysX and raises a ValueError when a
+    default lies outside its limits. Joints that are *not* listed in
+    ArticulationCfg.init_state.joint_pos default to 0, which is invalid for some of the
+    MJCF assets shipped with MimicKit (e.g. the GO2 *_calf_joint range is
+    [-2.7227, -0.83776], so the USD default of 0 is out of range).
+
+    The limits are taken from the same MJCF the USD is generated from, so a safe default
+    can be picked per offending joint without hard-coding any particular robot. Isaac Lab
+    resolves the keys with re.fullmatch() and raises when a key matches no joint, so only
+    the joints whose 0 actually lies outside their range are returned.
+
+    MimicKit overwrites joint positions from the env's init_pose / motion data on reset,
+    so these values only affect Isaac Lab's initial validation.
+    """
+    import xml.etree.ElementTree as ET
+
+    joint_pos = {}
+
+    asset_root, asset_ext = os.path.splitext(asset_file)
+    mjcf_file = asset_file if (asset_ext == ".xml") else asset_root + ".xml"
+    if (not os.path.isfile(mjcf_file)):
+        return joint_pos
+
+    mjcf_root = ET.parse(mjcf_file).getroot()
+    for joint in mjcf_root.iter("joint"):
+        joint_name = joint.get("name")
+        joint_range = joint.get("range")
+        if (joint_name is None or joint_range is None):
+            continue
+
+        joint_min, joint_max = (float(val) for val in joint_range.split())
+        if (joint_min <= 0.0 <= joint_max):
+            continue
+
+        # nudge the default just inside the range to stay clear of the limit check
+        margin = 0.01 * (joint_max - joint_min)
+        default_val = joint_min + margin if (joint_min > 0.0) else joint_max - margin
+        joint_pos[joint_name] = default_val
+
+    return joint_pos
+
 class ObjCfg:
     def __init__(self, obj_type, asset_file, is_visual, enable_self_collisions, 
                 fix_root, start_pos, start_rot, color, disable_motors):
@@ -939,30 +984,11 @@ class IsaacLabEngine(engine.Engine):
 
         prim_path = OBJ_PATH_TEMPLATE.format(env_id, obj_id)
 
-        # Isaac Lab's Articulation._validate_cfg raises a ValueError if the USD
-        # default joint positions fall outside the configured joint limits
-        # (e.g. GO2 *_calf_joint default is 0, limits are [-2.723, -0.838]).
-        # Provide safe defaults via init_state.joint_pos. MimicKit's per-env
-        # init_pose / motion reset still override these at run time, so this
-        # only affects the USD default initialization.
-        # Isaac Lab's joint_pos is keyed by joint name (no regex), so list every joint.
-        default_joint_pos = {
-            "FR_hip_joint": 0.0,    "FR_thigh_joint": 0.9,    "FR_calf_joint": -1.5,
-            "FL_hip_joint": 0.0,    "FL_thigh_joint": 0.9,    "FL_calf_joint": -1.5,
-            "RR_hip_joint": 0.0,    "RR_thigh_joint": 0.9,    "RR_calf_joint": -1.5,
-            "RL_hip_joint": 0.0,    "RL_thigh_joint": 0.9,    "RL_calf_joint": -1.5,
-            # humanoid (37-DoF body parts, 1-DoF = revolute, 3-DoF = ball joint)
-            "abdomen_x": 0.0,  "abdomen_y": 0.0,  "abdomen_z": 0.0,
-            "neck_x": 0.0,     "neck_y": 0.0,     "neck_z": 0.0,
-            "right_shoulder_x": 0.0, "right_shoulder_y": 0.0, "right_shoulder_z": 0.0,
-            "right_elbow": 0.0,
-            "left_shoulder_x": 0.0,  "left_shoulder_y": 0.0,  "left_shoulder_z": 0.0,
-            "left_elbow": 0.0,
-            "right_hip_x": 0.0,  "right_hip_y": 0.0,  "right_hip_z": 0.0,
-            "right_knee": 0.0,   "right_ankle_x": 0.0, "right_ankle_y": 0.0, "right_ankle_z": 0.0,
-            "left_hip_x": 0.0,   "left_hip_y": 0.0,   "left_hip_z": 0.0,
-            "left_knee": 0.0,    "left_ankle_x": 0.0,  "left_ankle_y": 0.0,  "left_ankle_z": 0.0,
-        }
+        # Isaac Lab refuses to initialize an articulation whose default joint positions
+        # lie outside the joint limits (see calc_safe_joint_pos for details). MimicKit's
+        # per-env init_pose / motion reset overrides these at run time, so this only
+        # affects Isaac Lab's initial validation and the USD default state.
+        default_joint_pos = calc_safe_joint_pos(obj_cfg.asset_file)
         init_state = ArticulationCfg.InitialStateCfg(pos=obj_cfg.start_pos, rot=obj_cfg.start_rot,
                                                      joint_pos=default_joint_pos)
 
@@ -1007,7 +1033,13 @@ class IsaacLabEngine(engine.Engine):
         actuator_cfg = self._build_actuator_cfg(control_mode)
 
         regex = OBJ_PATH_TEMPLATE.format(".*", obj_id)
-        multi_obj_cfg = ArticulationCfg(prim_path=regex, spawn=None, actuators={"actuators": actuator_cfg})
+        # This is the articulation that actually survives: _build_obj drops the per-env
+        # prim it creates first and returns this wrapper, so it is the one Isaac Lab
+        # validates. It needs the same safe joint defaults, otherwise joints that default
+        # to 0 outside their own limits (e.g. GO2 *_calf_joint) fail validation.
+        init_state = ArticulationCfg.InitialStateCfg(joint_pos=calc_safe_joint_pos(obj_cfg.asset_file))
+        multi_obj_cfg = ArticulationCfg(prim_path=regex, spawn=None, init_state=init_state,
+                                        actuators={"actuators": actuator_cfg})
         multi_obj_prim = Articulation(multi_obj_cfg)
 
         return multi_obj_prim
